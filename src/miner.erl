@@ -516,10 +516,11 @@ do_initial_dkg(GenesisTransactions, Addrs, #state{curve=Curve}=State) ->
     SortedAddrs = lists:sort(Addrs),
     lager:info("SortedAddrs: ~p", [SortedAddrs]),
     N = blockchain_worker:num_consensus_members(),
+    N1 = N + 2, % correct for non-zero dkg F
     lager:info("N: ~p", [N]),
     F = ((N-1) div 3),
     lager:info("F: ~p", [F]),
-    ConsensusAddrs = lists:sublist(SortedAddrs, 1, N),
+    ConsensusAddrs = lists:sublist(SortedAddrs, 1, N1),
     lager:info("ConsensusAddrs: ~p", [ConsensusAddrs]),
     MyAddress = blockchain_swarm:pubkey_bin(),
     lager:info("MyAddress: ~p", [MyAddress]),
@@ -531,8 +532,8 @@ do_initial_dkg(GenesisTransactions, Addrs, #state{curve=Curve}=State) ->
             GenesisBlock = blockchain_block_v1:new_genesis_block(GenesisBlockTransactions),
             GroupArg = [miner_dkg_handler, [ConsensusAddrs,
                                             miner_util:index_of(MyAddress, ConsensusAddrs),
-                                            N,
-                                            0, %% NOTE: F for DKG is 0
+                                            N1,
+                                            1, %% NOTE: F for DKG is 1 to allow for some flex
                                             F, %% NOTE: T for DKG is the byzantine F
                                             Curve,
                                             blockchain_block:serialize(GenesisBlock),

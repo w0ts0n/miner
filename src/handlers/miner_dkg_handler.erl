@@ -35,7 +35,14 @@ init([Members, Id, N, F, T, Curve, ThingToSign, {SigMod, SigFun}, {DoneMod, Done
     {G1, G2} = generate(Curve, Members),
     DKG = dkg_hybriddkg:init(Id, N, F, T, G1, G2, 0, [{callback, true}]),
     lager:info("DKG~p started", [Id]),
-    {ok, #state{n=N, id=Id, f=F, t=T, g1=G1, g2=G2, curve=Curve, dkg=DKG, signatures_required=N, artifact=ThingToSign, sigmod=SigMod, sigfun=SigFun, donemod=DoneMod, donefun=DoneFun, members=Members}}.
+    {ok, #state{n = N, id = Id, f = F, t = T, g1 = G1, g2 = G2,
+                curve = Curve,
+                dkg = DKG,
+                signatures_required = N - (F * 2),
+                artifact = ThingToSign,
+                sigmod = SigMod, sigfun = SigFun,
+                donemod = DoneMod, donefun = DoneFun,
+                members = Members}}.
 
 handle_command(start, State) ->
     {NewDKG, {send, Msgs}} = dkg_hybriddkg:start(State#state.dkg),
