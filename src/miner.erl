@@ -57,7 +57,9 @@
     currently_syncing = false :: boolean(),
     election_interval :: pos_integer(),
     current_dkg = undefined :: undefined | pos_integer(),
-    current_height = -1 :: integer()
+    current_height = -1 :: integer(),
+    election_artifact ::x any(),
+    phase = normal :: genesis | election | normal
 }).
 
 -define(H3_MINIMUM_RESOLUTION, 9).
@@ -181,30 +183,10 @@ create_block(Stamps, Txns, HBBFTRound) ->
 %% @doc
 %% @end
 %%--------------------------------------------------------------------
--spec sign_genesis_block(GenesisBlock :: binary(),
-                         PrivKey :: tpke_privkey:privkey()) -> {ok, libp2p_crypto:pubkey_bin(), binary()}.
-sign_genesis_block(GenesisBlock, PrivKey) ->
-    gen_server:call(?MODULE, {sign_genesis_block, GenesisBlock, PrivKey}).
-
-%%--------------------------------------------------------------------
-%% @doc
-%% @end
-%%--------------------------------------------------------------------
--spec genesis_block_done(GenesisBLock :: binary(),
-                         Signatures :: [{libp2p_crypto:pubkey_bin(), binary()}],
-                         Members :: [libp2p_crypto:address()],
-                         PrivKey :: tpke_privkey:privkey()) -> ok.
-genesis_block_done(GenesisBlock, Signatures, Members, PrivKey) ->
-    gen_server:call(?MODULE, {genesis_block_done, GenesisBlock, Signatures, Members, PrivKey}).
-
-%%--------------------------------------------------------------------
-%% @doc
-%% @end
-%%--------------------------------------------------------------------
 -spec election_done(binary(), [{libp2p_crypto:address(), binary()}],
                     [libp2p_crypto:address()], tpke_privkey:privkey()) -> ok.
-election_done(SignedArtifact, Signatures, Members, PrivKey) ->
-    gen_server:call(?MODULE, {election_done, SignedArtifact, Signatures, Members, PrivKey}).
+dkg_done(Members, PrivKey) ->
+    gen_server:call(?MODULE, {dkg_done, Members, PrivKey}).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -384,9 +366,34 @@ handle_call({create_block, Stamps, Transactions, HBBFTRound},
             lager:warning("got unexpected block hashes in stamp information ~p", [List]),
             {reply, {error, multiple_hashes}, State}
     end;
+handle_call({signed_block, Signatures, BinaryGenesisBlock}, _From,
+            State=#state{consensus_group = ConsensusGroup,
+                         blockchain = Chain,
+                         phase = genesis,
+                         block_time = BlockTime}) ->
+    GenesisBlock = blockchain_block:deserialize(BinaryGenesisBlock),
+    SignedGenesisBlock = blockchain_block:set_signatures(GenesisBlock, Signatures),
+    lager:notice("Got a signed genesis block: ~p", [SignedGenesisBlock]),
+
+    case State#state.dkg_await of
+        undefined -> ok;
+        From -> gen_server:reply(From, ok)
+    end,
+
+    ok = blockchain_worker:integrate_genesis_block(SignedGenesisBlock),
+    Ref = erlang:send_after(BlockTime, self(), block_timeout),
+    ok = libp2p_swarm:add_stream_handler(blockchain_swarm:swarm(), ?TX_PROTOCOL,
+                                         {libp2p_framed_stream, server,
+                                          [blockchain_txn_handler, self(), Group]}),
+    %% NOTE: I *think* this is the only place to store the chain reference in the miner state
+    {reply, ok, State#state{block_timer = Ref,
+                            dkg_await = undefined, % not sure we use this again, but
+                            phase = normal,
+                            blockchain = Chain}};
 handle_call({signed_block, Signatures, Tempblock}, _From,
             State=#state{consensus_group = ConsensusGroup,
                          blockchain = Chain,
+                         phase = _,  %% eventually normal and election will be different cases
                          block_time = BlockTime}) when ConsensusGroup /= undefined ->
     %% Once a miner gets a sign_block message (only happens if the miner is in consensus group):
     %% * cancel the block timer
@@ -417,11 +424,6 @@ handle_call(in_consensus, _From, #state{consensus_pos=Pos}=State) ->
                 _ -> true
             end,
     {reply, Reply, State};
-handle_call({sign_genesis_block, GenesisBlock, _PrivateKey}, _From, State) ->
-    {ok, MyPubKey, SignFun} = blockchain_swarm:keys(),
-    Signature = SignFun(GenesisBlock),
-    Address = libp2p_crypto:pubkey_to_bin(MyPubKey),
-    {reply, {ok, Address, Signature}, State};
 handle_call({genesis_block_done, BinaryGenesisBlock, Signatures, Members, PrivKey}, _From,
             #state{batch_size = BatchSize,
                    block_time = BlockTime} = State) ->
@@ -462,26 +464,33 @@ handle_call({genesis_block_done, BinaryGenesisBlock, Signatures, Members, PrivKe
                             dkg_await = undefined, % not sure we use this again, but
                             current_height = 0,
                             blockchain = Chain}};
-handle_call({election_done, BinaryBlock, Signatures, Members, PrivKey}, _From,
+handle_call({dkg_done, Members, PrivKey}, _From,
             State = #state{consensus_group = OldGroup,
                            batch_size = BatchSize,
                            block_time = BlockTime,
                            blockchain = Chain,
+                           election_artifact = Artifact,
+                           phase = Phase,
                            current_height = CurrHeight}) ->
-    lager:info("election done at ~p", [CurrHeight]),
+    lager:info("dkg done at ~p in phase ~p", [CurrHeight, Phase]),
 
-    Block = blockchain_block:set_signatures(blockchain_block:deserialize(BinaryBlock), Signatures),
 
-    ok = blockchain:add_block(Block, Chain),
-    Height = blockchain_block:height(Block),
-    Swarm = blockchain_swarm:swarm(),
-    Address = blockchain_swarm:pubkey_bin(),
-    libp2p_group_gossip:send(
-      libp2p_swarm:gossip_group(Swarm),
-      ?GOSSIP_PROTOCOL,
-      term_to_binary({block, Address, Block})
-     ),
-    ok = blockchain_worker:notify({add_block, blockchain_block:hash_block(Block), true}),
+    %% here we want to initiate a new hbbft instance with either a
+    %% blank block (or snapshot) or the genesis block
+
+
+    %% Block = blockchain_block:set_signatures(blockchain_block:deserialize(BinaryBlock), Signatures),
+
+    %% ok = blockchain:add_block(Block, Chain),
+    %% Height = blockchain_block:height(Block),
+    %% Swarm = blockchain_swarm:swarm(),
+    %% Address = blockchain_swarm:pubkey_bin(),
+    %% libp2p_group_gossip:send(
+    %%   libp2p_swarm:gossip_group(Swarm),
+    %%   ?GOSSIP_PROTOCOL,
+    %%   term_to_binary({block, Address, Block})
+    %%  ),
+    %% ok = blockchain_worker:notify({add_block, blockchain_block:hash_block(Block), true}),
 
     N = blockchain_worker:num_consensus_members(),
     F = ((N - 1) div 3),
@@ -511,7 +520,7 @@ handle_call({election_done, BinaryBlock, Signatures, Members, PrivKey}, _From,
                                       Chain,
                                       Height,
                                       Buf]],
-    Ref = set_next_block_timer(Chain, BlockTime),
+
     Name = "consensus_" ++ integer_to_list(max(0, Height)),
     {ok, Group} = libp2p_swarm:add_group(blockchain_swarm:swarm(),
                                          Name,
@@ -520,6 +529,9 @@ handle_call({election_done, BinaryBlock, Signatures, Members, PrivKey}, _From,
     ok = libp2p_swarm:add_stream_handler(blockchain_swarm:swarm(), ?TX_PROTOCOL,
                                          {libp2p_framed_stream, server,
                                           [blockchain_txn_handler, self(), Group]}),
+
+    ok = libp2p_group_relcast:handle_call(Group, {unconditional_start, Artifact}),
+
     %% NOTE: I *think* this is the only place to store the chain reference in the miner state
     {reply, ok, State#state{consensus_group = Group,
                             block_timer = Ref,
@@ -532,6 +544,11 @@ handle_call(_Msg, _From, State) ->
     lager:warning("unhandled call ~p", [_Msg]),
     {reply, ok, State}.
 
+sign_genesis_block(GenesisBlock) ->
+    {ok, MyPubKey, SignFun} = blockchain_swarm:keys(),
+    Signature = SignFun(GenesisBlock),
+    Address = libp2p_crypto:pubkey_to_bin(MyPubKey),
+    {ok, Address, Signature}.
 
 handle_cast(_Msg, State) ->
     lager:warning("unhandled cast ~p", [_Msg]),
@@ -543,14 +560,14 @@ handle_info(maybe_restore_consensus, State=#state{election_interval=Interval}) -
     Chain = blockchain_worker:blockchain(),
     case Chain of
         undefined ->
-            {noreply, State};
+            {noreply, State#state{phase = genesis}};
         Chain ->
             {ok, Height} = blockchain:height(Chain),
             case Height rem Interval == 0 andalso Height /= 0 of
                 true ->
                     %% Restore an election round
                     {ok, Hash} = blockchain:head_hash(Chain),
-                    {noreply, initiate_election(Chain, Hash, Height, State)};
+                    {noreply, initiate_election(Chain, Hash, Height, State#state{phase = election})};
                 false ->
                     Ledger = blockchain:ledger(Chain),
                     case blockchain_ledger_v1:consensus_members(Ledger) of
@@ -687,20 +704,10 @@ initiate_election(Chain, Hash, Height, State) ->
 
     BlockFun =
         fun(N) ->
-                NewGroupTxn = [blockchain_txn_consensus_group_v1:new(lists:sublist(OrderedGateways, N))],
-                %% no idea what to do here
-
-                {ok, CurrentBlock} = blockchain:head_block(Chain),
-                {ok, CurrentBlockHash} = blockchain:head_hash(Chain),
-                blockchain_block_v1:new(#{prev_hash => CurrentBlockHash,
-                                     height => blockchain_block:height(CurrentBlock) + 1,
-                                     hbbft_round => Height,
-                                     time => 0,
-                                     transactions => NewGroupTxn,
-                                     signatures => []})
+                [blockchain_txn_consensus_group_v1:new(lists:sublist(OrderedGateways, N))]
         end,
-    {_, State1} = do_dkg(OrderedGateways, BlockFun, sign_genesis_block,
-                         election_done, State#state{current_height = Height}),
+    {_, State1} = do_dkg(OrderedGateways, BlockFun,
+                         dkg_done, State#state{current_height = Height}),
     State1.
 
 do_initial_dkg(GenesisTransactions, Addrs, State) ->
@@ -713,22 +720,23 @@ do_initial_dkg(GenesisTransactions, Addrs, State) ->
                 lager:info("ConsensusAddrs: ~p", [ConsensusAddrs]),
                 %% in the consensus group, run the dkg
                 GenesisBlockTransactions = GenesisTransactions ++
-                    [blockchain_txn_consensus_group_v1:new(ConsensusAddrs)],
-                blockchain_block:new_genesis_block(GenesisBlockTransactions)
+                    [blockchain_txn_consensus_group_v1:new(ConsensusAddrs)]
+                %% blockchain_block:new_genesis_block(GenesisBlockTransactions)
         end,
-    do_dkg(SortedAddrs, GenesisBlockFun, sign_genesis_block, genesis_block_done, State).
+    do_dkg(SortedAddrs, GenesisBlockFun, dkg_done, State).
 
-do_dkg(Addrs, ArtifactFun, Sign, Done, State=#state{curve = Curve,
-                                                 current_height = CurrHeight,
-                                                 current_dkg = CurrDkg}) ->
+do_dkg(Addrs, ArtifactFun, Done, State=#state{curve = Curve,
+                                              current_height = CurrHeight,
+                                              current_dkg = CurrDkg}) ->
     N = blockchain_worker:num_consensus_members(),
+    N1 = N + 2, % adjust upwards for 2f
     lager:info("N: ~p", [N]),
-    F = ((N-1) div 3),
+    F = ((N - 1) div 3),
     lager:info("F: ~p", [F]),
-    ConsensusAddrs = lists:sublist(Addrs, 1, N),
+    ConsensusAddrs = lists:sublist(Addrs, 1, N1),
     lager:info("ConsensusAddrs: ~p", [ConsensusAddrs]),
     MyAddress = blockchain_swarm:pubkey_bin(),
-    Artifact = ArtifactFun(N),
+    Artifact = ArtifactFun(N1),
     lager:info("MyAddress: ~p", [MyAddress]),
     case lists:member(MyAddress, ConsensusAddrs) of
         true when CurrDkg /= CurrHeight ->
@@ -737,12 +745,10 @@ do_dkg(Addrs, ArtifactFun, Sign, Done, State=#state{curve = Curve,
 
             GroupArg = [miner_dkg_handler, [ConsensusAddrs,
                                             miner_util:index_of(MyAddress, ConsensusAddrs),
-                                            N,
-                                            0, %% NOTE: F for DKG is 0
+                                            N1,
+                                            1, %% dfg f = 1 to allow for some failures
                                             F, %% NOTE: T for DKG is the byzantine F
                                             Curve,
-                                            blockchain_block:serialize(Artifact),
-                                            {miner, Sign},
                                             {miner, Done}]],
             %% make a simple hash of the consensus members
             DKGHash = base58:binary_to_base58(crypto:hash(sha, term_to_binary(ConsensusAddrs))),
@@ -756,6 +762,7 @@ do_dkg(Addrs, ArtifactFun, Sign, Done, State=#state{curve = Curve,
             lager:info("height ~p Address: ~p, ConsensusWorker pos: ~p",
                        [CurrHeight, MyAddress, Pos]),
             {true, State#state{consensus_pos = Pos,
+                               election_artifact = Artifact,
                                dkg_group = DKGGroup,
                                current_dkg = CurrHeight}};
         true ->
