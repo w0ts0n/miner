@@ -363,22 +363,29 @@ handle_udp_packet(<<?PROTOCOL_2:8/integer-unsigned,
                     JSONBin/binary>>, IP, Port, RxInstantLocal_us,
                     #state{socket=Socket, gateways=Gateways,
                            reg_domain_confirmed = RegDomainConfirmed}=State) ->
-    lager:info("PUSH_DATA ~p from ~p on ~p", [jsx:decode(JSONBin), MAC, Port]),
-    Gateway =
-        case maps:find(MAC, Gateways) of
-            {ok, #gateway{received=Received}=G} ->
-                %% We purposely do not update gateway's addr/port
-                %% here. They should only be updated when handling
-                %% PULL_DATA, otherwise we may send downlink packets
-                %% to the wrong place.
-                G#gateway{received=Received+1};
-            error ->
-                #gateway{mac=MAC, ip=IP, port=Port, received=1}
-        end,
-    Packet = <<?PROTOCOL_2:8/integer-unsigned, Token/binary, ?PUSH_ACK:8/integer-unsigned>>,
-    maybe_mirror(State#state.mirror_socket, Packet),
-    maybe_send_udp_ack(Socket, IP, Port, Packet, RegDomainConfirmed),
-    handle_json_data(jsx:decode(JSONBin, [return_maps]), Gateway, RxInstantLocal_us, State);
+    try jsx:decode(JSONBin, [return_maps]) of
+        JSON ->
+            lager:info("PUSH_DATA ~p from ~p on ~p", [JSON, MAC, Port]),
+            Gateway =
+                case maps:find(MAC, Gateways) of
+                    {ok, #gateway{received=Received}=G} ->
+                        %% We purposely do not update gateway's addr/port
+                        %% here. They should only be updated when handling
+                        %% PULL_DATA, otherwise we may send downlink packets
+                        %% to the wrong place.
+                        G#gateway{received=Received+1};
+                    error ->
+                        #gateway{mac=MAC, ip=IP, port=Port, received=1}
+                end,
+            Packet = <<?PROTOCOL_2:8/integer-unsigned, Token/binary, ?PUSH_ACK:8/integer-unsigned>>,
+            maybe_mirror(State#state.mirror_socket, Packet),
+            maybe_send_udp_ack(Socket, IP, Port, Packet, RegDomainConfirmed),
+            handle_json_data(JSON, Gateway, RxInstantLocal_us, State)
+    catch
+        _ ->
+            lager:warn("PUSH_DATA with invalid JSON ~p from ~p on ~p", [JSONBin, MAC, Port]),
+            State
+    end;
 handle_udp_packet(<<?PROTOCOL_2:8/integer-unsigned,
                     Token:2/binary,
                     ?PULL_DATA:8/integer-unsigned,
