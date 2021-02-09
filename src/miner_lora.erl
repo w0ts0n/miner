@@ -360,10 +360,10 @@ handle_udp_packet(<<?PROTOCOL_2:8/integer-unsigned,
                     Token:2/binary,
                     ?PUSH_DATA:8/integer-unsigned,
                     MAC:64/integer,
-                    JSON/binary>>, IP, Port, RxInstantLocal_us,
+                    JSONBin/binary>>, IP, Port, RxInstantLocal_us,
                     #state{socket=Socket, gateways=Gateways,
                            reg_domain_confirmed = RegDomainConfirmed}=State) ->
-    lager:info("PUSH_DATA ~p from ~p on ~p", [jsx:decode(JSON), MAC, Port]),
+    lager:info("PUSH_DATA ~p from ~p on ~p", [jsx:decode(JSONBin), MAC, Port]),
     Gateway =
         case maps:find(MAC, Gateways) of
             {ok, #gateway{received=Received}=G} ->
@@ -378,7 +378,7 @@ handle_udp_packet(<<?PROTOCOL_2:8/integer-unsigned,
     Packet = <<?PROTOCOL_2:8/integer-unsigned, Token/binary, ?PUSH_ACK:8/integer-unsigned>>,
     maybe_mirror(State#state.mirror_socket, Packet),
     maybe_send_udp_ack(Socket, IP, Port, Packet, RegDomainConfirmed),
-    handle_json_data(jsx:decode(JSON, [return_maps]), Gateway, RxInstantLocal_us, State);
+    handle_json_data(jsx:decode(JSONBin, [return_maps]), Gateway, RxInstantLocal_us, State);
 handle_udp_packet(<<?PROTOCOL_2:8/integer-unsigned,
                     Token:2/binary,
                     ?PULL_DATA:8/integer-unsigned,
